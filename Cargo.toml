@@ -1,0 +1,8 @@
+[package]
+name = "rategate"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A token bucket rate limiter, as a library and a CLI simulator."
+
+[dependencies]
