@@ -38,6 +38,30 @@ which takes the current time as an explicit `f64` number of seconds — this is
 what lets the bucket be tested and simulated deterministically instead of
 depending on real elapsed time, and it's what the CLI below is built on.
 
+There's also a sliding window limiter in `rategate::sliding_window`, for
+cases where you need an exact "never more than N requests in any window of
+T seconds" guarantee rather than a token bucket's continuously refilling
+balance:
+
+```rust
+use rategate::sliding_window::SlidingWindowLimiter;
+
+// at most 100 requests in any trailing 60 second window
+let mut limiter = SlidingWindowLimiter::new(100, 60.0);
+
+if limiter.try_acquire() {
+    // handle the request
+} else {
+    // reject it
+}
+```
+
+The tradeoff against `TokenBucket` is memory: a sliding window limiter keeps
+one timestamp per request still inside the window, so it's `O(limit)` rather
+than `O(1)`. In exchange, a burst that used up capacity right at the start
+of a window can't buy that capacity back until the window has fully passed
+— there's no gradual refill to take advantage of.
+
 ## CLI usage
 
 The `simulate` subcommand reads a list of request arrival times (one

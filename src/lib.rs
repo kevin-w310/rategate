@@ -105,3 +105,131 @@ mod tests {
         assert!(result.is_err());
     }
 }
+
+/// Sliding window rate limiting.
+///
+/// Where a token bucket tracks a single continuously refilling balance, a
+/// sliding window limiter remembers the timestamp of every request that
+/// landed inside the trailing `window` and simply counts them. That makes
+/// the guarantee exact — never more than `limit` requests in any `window`
+/// seconds, full stop — at the cost of O(limit) memory instead of O(1). It
+/// also means, unlike a token bucket, that a burst right at the start of a
+/// window doesn't buy back capacity early: it has to fully age out.
+pub mod sliding_window {
+    use std::collections::VecDeque;
+    use std::time::Instant;
+
+    pub struct SlidingWindowLimiter {
+        limit: usize,
+        window: f64,
+        timestamps: VecDeque<f64>,
+        epoch: Instant,
+    }
+
+    impl SlidingWindowLimiter {
+        /// Creates a limiter allowing at most `limit` requests in any
+        /// trailing `window` seconds. Panics if `limit` is zero or
+        /// `window` is not positive, for the same reason `TokenBucket`
+        /// rejects non-positive configuration: it's almost certainly a
+        /// caller mistake rather than an intended "always deny" limiter.
+        pub fn new(limit: usize, window: f64) -> Self {
+            assert!(limit > 0, "limit must be positive");
+            assert!(window > 0.0, "window must be positive");
+            SlidingWindowLimiter {
+                limit,
+                window,
+                timestamps: VecDeque::new(),
+                epoch: Instant::now(),
+            }
+        }
+
+        /// Attempts to record a request using the wall clock. Returns
+        /// `true` if it fits within the limit for the trailing window,
+        /// otherwise `false` and the window is left untouched aside from
+        /// evicting entries that have aged out.
+        pub fn try_acquire(&mut self) -> bool {
+            let now = self.epoch.elapsed().as_secs_f64();
+            self.try_acquire_at(now)
+        }
+
+        /// Same as `try_acquire`, but the caller supplies "now" as seconds
+        /// since the limiter was created, for deterministic testing and
+        /// simulation. Timestamps must be non-decreasing across calls.
+        pub fn try_acquire_at(&mut self, now: f64) -> bool {
+            self.evict_before(now - self.window);
+
+            if self.timestamps.len() < self.limit {
+                self.timestamps.push_back(now);
+                true
+            } else {
+                false
+            }
+        }
+
+        /// Requests still allowed in the current window, as of the wall
+        /// clock.
+        pub fn remaining(&mut self) -> usize {
+            let now = self.epoch.elapsed().as_secs_f64();
+            self.evict_before(now - self.window);
+            self.limit - self.timestamps.len()
+        }
+
+        /// Drops timestamps that are now outside the window, i.e. at or
+        /// before `cutoff` (= now - window).
+        fn evict_before(&mut self, cutoff: f64) {
+            while let Some(&front) = self.timestamps.front() {
+                if front <= cutoff {
+                    self.timestamps.pop_front();
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn allows_up_to_limit_within_window() {
+            let mut limiter = SlidingWindowLimiter::new(3, 1.0);
+            assert!(limiter.try_acquire_at(0.0));
+            assert!(limiter.try_acquire_at(0.1));
+            assert!(limiter.try_acquire_at(0.2));
+            assert!(!limiter.try_acquire_at(0.3));
+        }
+
+        #[test]
+        fn old_requests_age_out_of_the_window() {
+            let mut limiter = SlidingWindowLimiter::new(2, 1.0);
+            assert!(limiter.try_acquire_at(0.0));
+            assert!(limiter.try_acquire_at(0.5));
+            assert!(!limiter.try_acquire_at(0.9));
+            // the request at t=0.0 is now outside the trailing 1s window
+            assert!(limiter.try_acquire_at(1.1));
+        }
+
+        #[test]
+        fn boundary_is_exclusive_of_the_window_edge() {
+            let mut limiter = SlidingWindowLimiter::new(1, 1.0);
+            assert!(limiter.try_acquire_at(0.0));
+            // exactly one window later, the first request has fully aged out
+            assert!(limiter.try_acquire_at(1.0));
+        }
+
+        #[test]
+        fn remaining_reflects_evictions() {
+            let mut limiter = SlidingWindowLimiter::new(2, 1.0);
+            assert!(limiter.try_acquire_at(0.0));
+            assert!(limiter.try_acquire_at(0.0));
+            assert_eq!(limiter.remaining(), 0);
+        }
+
+        #[test]
+        fn rejects_non_positive_config() {
+            let result = std::panic::catch_unwind(|| SlidingWindowLimiter::new(0, 1.0));
+            assert!(result.is_err());
+        }
+    }
+}
