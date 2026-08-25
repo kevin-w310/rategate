@@ -130,7 +130,7 @@ fn run_simulate(args: &[String]) {
         outcomes.push(Outcome {
             t,
             allowed,
-            remaining: bucket.available(),
+            remaining: bucket.tokens(),
         });
     }
 

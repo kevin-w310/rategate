@@ -61,10 +61,23 @@ impl TokenBucket {
         }
     }
 
-    /// Tokens currently available, as of the wall clock.
+    /// Tokens currently available, as of the wall clock. Don't call this
+    /// from code that otherwise drives the bucket with `try_acquire_at`:
+    /// it advances `last_update` to the wall clock, and a later
+    /// `try_acquire_at` call would then compute `elapsed` against that
+    /// wall-clock instant instead of the simulated timeline, silently
+    /// corrupting the refill math. Simulated callers should use `tokens`
+    /// instead, which reads the balance without touching the clock.
     pub fn available(&mut self) -> f64 {
         let now = self.epoch.elapsed().as_secs_f64();
         self.try_acquire_at(now, 0.0);
+        self.tokens
+    }
+
+    /// Tokens currently available, without advancing any clock. Safe to
+    /// call between `try_acquire_at` calls in a simulation, unlike
+    /// `available`.
+    pub fn tokens(&self) -> f64 {
         self.tokens
     }
 }
@@ -103,6 +116,20 @@ mod tests {
     fn rejects_non_positive_config() {
         let result = std::panic::catch_unwind(|| TokenBucket::new(0.0, 1.0));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn querying_balance_does_not_disturb_the_simulated_clock() {
+        let mut bucket = TokenBucket::new(3.0, 1.0);
+        assert!(bucket.try_acquire_at(0.0, 1.0));
+        assert_eq!(bucket.tokens(), 2.0);
+        // reading the balance repeatedly must be a no-op on the clock
+        assert_eq!(bucket.tokens(), 2.0);
+        // one simulated second later, exactly one token should have
+        // regenerated, which only holds if `tokens()` above left
+        // `last_update` at 0.0 instead of skewing it toward the wall clock
+        assert!(bucket.try_acquire_at(1.0, 1.0));
+        assert_eq!(bucket.tokens(), 2.0);
     }
 }
 
