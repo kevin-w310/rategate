@@ -64,27 +64,45 @@ of a window can't buy that capacity back until the window has fully passed
 
 ## CLI usage
 
-The `simulate` subcommand reads a list of request arrival times (one
-floating point number of seconds per line) from stdin and reports, for each
-one, whether a bucket with the given parameters would have allowed it.
+The `simulate` subcommand reads one request per line from stdin and reports,
+for each one, whether a bucket with the given parameters would have allowed
+it. A line is either a bare timestamp (seconds, as a float):
 
 ```
 $ printf '0.0\n0.1\n0.2\n0.3\n0.4\n0.5\n1.5\n' | rategate simulate --capacity 3 --refill-rate 1
-t=0.00  ALLOW  remaining=2.00
-t=0.10  ALLOW  remaining=1.10
-t=0.20  ALLOW  remaining=0.20
-t=0.30  DENY   remaining=0.30
-t=0.40  DENY   remaining=0.40
-t=0.50  DENY   remaining=0.50
-t=1.50  ALLOW  remaining=0.50
+client=default  t=0.00  ALLOW  remaining=2.00
+client=default  t=0.10  ALLOW  remaining=1.10
+client=default  t=0.20  ALLOW  remaining=0.20
+client=default  t=0.30  DENY   remaining=0.30
+client=default  t=0.40  DENY   remaining=0.40
+client=default  t=0.50  DENY   remaining=0.50
+client=default  t=1.50  ALLOW  remaining=0.50
 7 requests: 4 allowed, 3 denied
 ```
+
+or a client id followed by a timestamp, in which case each distinct client
+gets its own independent bucket with the same `--capacity`, `--refill-rate`,
+and `--cost` — useful for checking whether one noisy client would exhaust a
+shared limit or just its own:
+
+```
+$ printf 'alice 0.0\nbob 0.0\nalice 0.1\nalice 0.2\nalice 0.3\n' | rategate simulate --capacity 2 --refill-rate 1
+client=alice  t=0.00  ALLOW  remaining=1.00
+client=bob    t=0.00  ALLOW  remaining=1.00
+client=alice  t=0.10  ALLOW  remaining=0.10
+client=alice  t=0.20  DENY   remaining=0.20
+client=alice  t=0.30  DENY   remaining=0.30
+5 requests: 3 allowed, 2 denied
+```
+
+The two line formats can be mixed; bare timestamps always share a single
+implicit `default` bucket.
 
 The same run with `--json` for feeding into another tool or a dashboard:
 
 ```
 $ printf '0.0\n0.1\n0.2\n0.3\n0.4\n0.5\n1.5\n' | rategate simulate --capacity 3 --refill-rate 1 --json
-{"capacity":3.00,"refill_rate":1.00,"cost":1.00,"results":[{"t":0.00,"allowed":true,"remaining":2.00},{"t":0.10,"allowed":true,"remaining":1.10},{"t":0.20,"allowed":true,"remaining":0.20},{"t":0.30,"allowed":false,"remaining":0.30},{"t":0.40,"allowed":false,"remaining":0.40},{"t":0.50,"allowed":false,"remaining":0.50},{"t":1.50,"allowed":true,"remaining":0.50}],"summary":{"total":7,"allowed":4,"denied":3}}
+{"capacity":3.00,"refill_rate":1.00,"cost":1.00,"results":[{"client":"default","t":0.00,"allowed":true,"remaining":2.00},{"client":"default","t":0.10,"allowed":true,"remaining":1.10},{"client":"default","t":0.20,"allowed":true,"remaining":0.20},{"client":"default","t":0.30,"allowed":false,"remaining":0.30},{"client":"default","t":0.40,"allowed":false,"remaining":0.40},{"client":"default","t":0.50,"allowed":false,"remaining":0.50},{"client":"default","t":1.50,"allowed":true,"remaining":0.50}],"summary":{"total":7,"allowed":4,"denied":3}}
 ```
 
 Options:
