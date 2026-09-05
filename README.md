@@ -98,6 +98,20 @@ client=alice  t=0.30  DENY   remaining=0.30
 The two line formats can be mixed; bare timestamps always share a single
 implicit `default` bucket.
 
+With `--from-log`, stdin is instead parsed as Common/Combined Log Format
+access log lines — the client id is the first field (normally the source
+address) and the timestamp is the bracketed date, converted from its UTC
+offset and reported relative to the first line's timestamp:
+
+```
+$ printf '10.0.0.1 - - [10/Oct/2000:13:55:36 -0700] "GET / HTTP/1.0" 200 326\n10.0.0.1 - - [10/Oct/2000:13:55:36 -0700] "GET / HTTP/1.0" 200 326\n10.0.0.1 - - [10/Oct/2000:13:55:37 -0700] "GET / HTTP/1.0" 200 326\n' \
+  | rategate simulate --capacity 1 --refill-rate 1 --from-log
+client=10.0.0.1  t=0.00  ALLOW  remaining=0.00
+client=10.0.0.1  t=0.00  DENY   remaining=0.00
+client=10.0.0.1  t=1.00  ALLOW  remaining=0.00
+3 requests: 2 allowed, 1 denied
+```
+
 The same run with `--json` for feeding into another tool or a dashboard:
 
 ```
@@ -111,6 +125,8 @@ Options:
 - `--refill-rate N` — tokens regenerated per second (required)
 - `--cost N` — tokens each request consumes (default `1`)
 - `--json` — emit the single JSON object shown above instead of text
+- `--from-log` — parse stdin as Common/Combined Log Format access log lines
+  instead of `<timestamp>` / `<client> <timestamp>` pairs
 
 ## Building
 

@@ -18,7 +18,7 @@ fn main() {
 
 fn print_usage() {
     println!(
-        "rategate simulate --capacity N --refill-rate N [--cost N] [--json]\n\
+        "rategate simulate --capacity N --refill-rate N [--cost N] [--json] [--from-log]\n\
          \n\
          Reads one request per line from stdin, each either a bare\n\
          timestamp ('1.5') or a client id followed by a timestamp\n\
@@ -28,11 +28,20 @@ fn print_usage() {
          independent bucket with the same capacity, refill rate, and\n\
          cost, so several clients can be simulated in one run.\n\
          \n\
+         With --from-log, each line is instead parsed as a Common/Combined\n\
+         Log Format access log line, e.g.:\n\
+         \x20\x20127.0.0.1 - - [10/Oct/2000:13:55:36 -0700] \"GET / HTTP/1.0\" 200 326\n\
+         The client id is the first whitespace-separated field (normally\n\
+         the request's source address), and the timestamp is the bracketed\n\
+         date, converted to UTC and reported relative to the first line's\n\
+         timestamp so the output reads the same as the plain timeline mode.\n\
+         \n\
          Options:\n\
          \x20\x20--capacity N     bucket size in tokens (required)\n\
          \x20\x20--refill-rate N  tokens added per second (required)\n\
          \x20\x20--cost N         tokens each request consumes (default 1)\n\
-         \x20\x20--json           emit a single JSON object instead of text"
+         \x20\x20--json           emit a single JSON object instead of text\n\
+         \x20\x20--from-log       parse stdin lines as access log entries"
     );
 }
 
@@ -41,6 +50,7 @@ struct SimulateArgs {
     refill_rate: f64,
     cost: f64,
     json: bool,
+    from_log: bool,
 }
 
 fn parse_simulate_args(args: &[String]) -> SimulateArgs {
@@ -48,6 +58,7 @@ fn parse_simulate_args(args: &[String]) -> SimulateArgs {
     let mut refill_rate = None;
     let mut cost = 1.0;
     let mut json = false;
+    let mut from_log = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -63,6 +74,10 @@ fn parse_simulate_args(args: &[String]) -> SimulateArgs {
             }
             "--json" => {
                 json = true;
+                i += 1;
+            }
+            "--from-log" => {
+                from_log = true;
                 i += 1;
             }
             other => {
@@ -86,6 +101,7 @@ fn parse_simulate_args(args: &[String]) -> SimulateArgs {
         refill_rate,
         cost,
         json,
+        from_log,
     }
 }
 
@@ -114,6 +130,10 @@ fn run_simulate(args: &[String]) {
     let opts = parse_simulate_args(args);
     let mut buckets: HashMap<String, TokenBucket> = HashMap::new();
     let mut outcomes = Vec::new();
+    // The first timestamp seen becomes t=0, so --from-log output reads on
+    // the same small relative scale as the plain timeline mode instead of
+    // printing raw Unix epoch seconds.
+    let mut log_epoch: Option<f64> = None;
 
     for (line_no, line) in io::stdin().lock().lines().enumerate() {
         let line = line.unwrap_or_else(|err| {
@@ -125,7 +145,13 @@ fn run_simulate(args: &[String]) {
             continue;
         }
 
-        let (client, t) = parse_request_line(line, line_no + 1);
+        let (client, t) = if opts.from_log {
+            let (client, epoch) = parse_log_line(line, line_no + 1);
+            let base = *log_epoch.get_or_insert(epoch);
+            (client, epoch - base)
+        } else {
+            parse_request_line(line, line_no + 1)
+        };
         let bucket = buckets
             .entry(client.clone())
             .or_insert_with(|| TokenBucket::new(opts.capacity, opts.refill_rate));
@@ -167,6 +193,113 @@ fn parse_request_line(line: &str, line_no: usize) -> (String, f64) {
     });
 
     (client.to_string(), t)
+}
+
+/// Parses one line of stdin as a Common/Combined Log Format access log
+/// entry: the client id is the first whitespace-separated field (normally
+/// the source address), and the timestamp is the bracketed date, e.g.
+/// `127.0.0.1 - - [10/Oct/2000:13:55:36 -0700] "GET / HTTP/1.0" 200 326`.
+fn parse_log_line(line: &str, line_no: usize) -> (String, f64) {
+    let client = line.split_whitespace().next().unwrap_or_else(|| {
+        eprintln!("rategate: line {line_no}: could not find a client address in '{line}'");
+        std::process::exit(2);
+    });
+
+    let open = line.find('[').unwrap_or_else(|| {
+        eprintln!("rategate: line {line_no}: no '[timestamp]' field in '{line}'");
+        std::process::exit(2);
+    });
+    let close = line[open..].find(']').map(|i| open + i).unwrap_or_else(|| {
+        eprintln!("rategate: line {line_no}: unterminated '[timestamp' field in '{line}'");
+        std::process::exit(2);
+    });
+
+    let epoch = parse_clf_timestamp(&line[open + 1..close]).unwrap_or_else(|| {
+        eprintln!(
+            "rategate: line {line_no}: '{}' is not a recognized log timestamp",
+            &line[open + 1..close]
+        );
+        std::process::exit(2);
+    });
+
+    (client.to_string(), epoch)
+}
+
+/// Parses a Common Log Format timestamp such as `10/Oct/2000:13:55:36
+/// -0700` into Unix epoch seconds (UTC). Returns `None` on any format
+/// mismatch, leaving error reporting to the caller.
+fn parse_clf_timestamp(ts: &str) -> Option<f64> {
+    let (datetime, offset) = ts.split_once(' ')?;
+
+    let mut day_split = datetime.splitn(2, '/');
+    let day_str = day_split.next()?;
+    let rest = day_split.next()?;
+    let mut month_split = rest.splitn(2, '/');
+    let month_str = month_split.next()?;
+    let rest = month_split.next()?;
+    let mut year_split = rest.splitn(2, ':');
+    let year_str = year_split.next()?;
+    let time_str = year_split.next()?;
+
+    let mut time_parts = time_str.splitn(3, ':');
+    let hour: i64 = time_parts.next()?.parse().ok()?;
+    let min: i64 = time_parts.next()?.parse().ok()?;
+    let sec: i64 = time_parts.next()?.parse().ok()?;
+
+    let day: u32 = day_str.parse().ok()?;
+    let year: i64 = year_str.parse().ok()?;
+    let month = month_from_abbrev(month_str)?;
+    let offset_seconds = parse_utc_offset(offset)?;
+
+    let days = days_from_civil(year, month, day);
+    let local_seconds = days * 86400 + hour * 3600 + min * 60 + sec;
+    Some((local_seconds - offset_seconds) as f64)
+}
+
+fn month_from_abbrev(s: &str) -> Option<u32> {
+    Some(match s {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    })
+}
+
+/// Parses a `+HHMM` / `-HHMM` UTC offset into seconds east of UTC.
+fn parse_utc_offset(s: &str) -> Option<i64> {
+    if s.len() != 5 {
+        return None;
+    }
+    let sign = match &s[0..1] {
+        "+" => 1,
+        "-" => -1,
+        _ => return None,
+    };
+    let hh: i64 = s[1..3].parse().ok()?;
+    let mm: i64 = s[3..5].parse().ok()?;
+    Some(sign * (hh * 3600 + mm * 60))
+}
+
+/// Days since 1970-01-01 for a given civil (proleptic Gregorian) date.
+/// Handles dates on either side of the epoch; see Howard Hinnant's
+/// "chrono-Compatible Low-Level Date Algorithms" for the derivation.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (if m > 2 { m - 3 } else { m + 9 }) as i64;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
 }
 
 fn print_text(outcomes: &[Outcome]) {
@@ -263,5 +396,42 @@ mod tests {
     #[test]
     fn json_escape_passes_through_plain_text() {
         assert_eq!(json_escape("alice"), "alice");
+    }
+
+    #[test]
+    fn clf_timestamp_matches_known_epoch() {
+        // the canonical example from the Apache log format docs
+        assert_eq!(
+            parse_clf_timestamp("10/Oct/2000:13:55:36 -0700"),
+            Some(971_211_336.0)
+        );
+    }
+
+    #[test]
+    fn clf_timestamp_handles_positive_offset() {
+        // same wall-clock time, east of UTC instead of west
+        assert_eq!(
+            parse_clf_timestamp("10/Oct/2000:13:55:36 +0700"),
+            Some(971_160_936.0)
+        );
+    }
+
+    #[test]
+    fn clf_timestamp_rejects_garbage() {
+        assert_eq!(parse_clf_timestamp("not a timestamp"), None);
+    }
+
+    #[test]
+    fn days_from_civil_matches_known_epoch_date() {
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(2000, 10, 10), 11_240);
+    }
+
+    #[test]
+    fn log_line_extracts_client_and_timestamp() {
+        let line = r#"127.0.0.1 - frank [10/Oct/2000:13:55:36 -0700] "GET / HTTP/1.0" 200 2326"#;
+        let (client, t) = parse_log_line(line, 1);
+        assert_eq!(client, "127.0.0.1");
+        assert_eq!(t, 971_211_336.0);
     }
 }
