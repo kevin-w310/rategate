@@ -8,6 +8,43 @@
 
 use std::time::Instant;
 
+/// Standard rate-limit response headers describing a single decision.
+///
+/// The names follow the de facto convention used by most HTTP APIs
+/// (`X-RateLimit-*` for the current allowance, `Retry-After` for how long
+/// to wait after a denial) rather than any ratified standard — the closest
+/// thing, `draft-ietf-httpapi-ratelimit-headers`, expired without being
+/// finalized. Callers wire these onto an actual response; this crate has
+/// no HTTP dependency of its own.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RateLimitHeaders {
+    /// Maximum requests/tokens allowed per window — `X-RateLimit-Limit`.
+    pub limit: u64,
+    /// Requests/tokens still available right now — `X-RateLimit-Remaining`.
+    pub remaining: u64,
+    /// Seconds until the allowance is fully restored — `X-RateLimit-Reset`.
+    pub reset_seconds: u64,
+    /// Seconds the client should wait before retrying. Only set when the
+    /// request was denied; renders as `Retry-After`.
+    pub retry_after_seconds: Option<u64>,
+}
+
+impl RateLimitHeaders {
+    /// Renders the headers as `(name, value)` pairs, in the order they're
+    /// conventionally sent, ready to attach to an HTTP response.
+    pub fn as_pairs(&self) -> Vec<(&'static str, String)> {
+        let mut pairs = vec![
+            ("X-RateLimit-Limit", self.limit.to_string()),
+            ("X-RateLimit-Remaining", self.remaining.to_string()),
+            ("X-RateLimit-Reset", self.reset_seconds.to_string()),
+        ];
+        if let Some(retry_after) = self.retry_after_seconds {
+            pairs.push(("Retry-After", retry_after.to_string()));
+        }
+        pairs
+    }
+}
+
 pub struct TokenBucket {
     capacity: f64,
     refill_rate: f64,
@@ -80,6 +117,30 @@ impl TokenBucket {
     pub fn tokens(&self) -> f64 {
         self.tokens
     }
+
+    /// Builds `RateLimitHeaders` describing the bucket immediately after a
+    /// `try_acquire`/`try_acquire_at` call. `allowed` and `cost` should be
+    /// the same values used for that call, so `Retry-After` reflects the
+    /// wait for the request that was just decided rather than some other
+    /// hypothetical cost.
+    pub fn headers(&self, allowed: bool, cost: f64) -> RateLimitHeaders {
+        let remaining = self.tokens.floor().max(0.0) as u64;
+        let reset_seconds = ((self.capacity - self.tokens) / self.refill_rate)
+            .ceil()
+            .max(0.0) as u64;
+        let retry_after_seconds = if allowed {
+            None
+        } else {
+            Some(((cost - self.tokens) / self.refill_rate).ceil().max(0.0) as u64)
+        };
+
+        RateLimitHeaders {
+            limit: self.capacity.round() as u64,
+            remaining,
+            reset_seconds,
+            retry_after_seconds,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -130,6 +191,49 @@ mod tests {
         // `last_update` at 0.0 instead of skewing it toward the wall clock
         assert!(bucket.try_acquire_at(1.0, 1.0));
         assert_eq!(bucket.tokens(), 2.0);
+    }
+
+    #[test]
+    fn headers_on_allow_have_no_retry_after() {
+        let mut bucket = TokenBucket::new(5.0, 1.0);
+        let allowed = bucket.try_acquire_at(0.0, 2.0);
+        let headers = bucket.headers(allowed, 2.0);
+        assert_eq!(
+            headers,
+            RateLimitHeaders {
+                limit: 5,
+                remaining: 3,
+                reset_seconds: 2,
+                retry_after_seconds: None,
+            }
+        );
+    }
+
+    #[test]
+    fn headers_on_deny_report_retry_after() {
+        let mut bucket = TokenBucket::new(5.0, 2.0);
+        bucket.try_acquire_at(0.0, 5.0);
+        // bucket is now empty; a cost-3 request needs 1.5s to become available
+        let allowed = bucket.try_acquire_at(0.0, 3.0);
+        let headers = bucket.headers(allowed, 3.0);
+        assert!(!allowed);
+        assert_eq!(headers.remaining, 0);
+        assert_eq!(headers.retry_after_seconds, Some(2));
+    }
+
+    #[test]
+    fn headers_as_pairs_omits_retry_after_when_allowed() {
+        let mut bucket = TokenBucket::new(5.0, 1.0);
+        let allowed = bucket.try_acquire_at(0.0, 1.0);
+        let pairs = bucket.headers(allowed, 1.0).as_pairs();
+        assert_eq!(
+            pairs,
+            vec![
+                ("X-RateLimit-Limit", "5".to_string()),
+                ("X-RateLimit-Remaining", "4".to_string()),
+                ("X-RateLimit-Reset", "1".to_string()),
+            ]
+        );
     }
 }
 
@@ -201,6 +305,29 @@ pub mod sliding_window {
             self.limit - self.timestamps.len()
         }
 
+        /// Builds `RateLimitHeaders` describing the limiter immediately
+        /// after a `try_acquire`/`try_acquire_at` call. `now` and `allowed`
+        /// should be the same values used for that call. Unlike a token
+        /// bucket, a sliding window has only one relevant point in time —
+        /// when the oldest tracked request ages out — so `Retry-After` and
+        /// `X-RateLimit-Reset` always agree on a denial.
+        pub fn headers(&self, now: f64, allowed: bool) -> super::RateLimitHeaders {
+            let remaining = (self.limit - self.timestamps.len()) as u64;
+            let reset_seconds = self
+                .timestamps
+                .front()
+                .map(|&front| (front + self.window - now).ceil().max(0.0) as u64)
+                .unwrap_or(0);
+            let retry_after_seconds = if allowed { None } else { Some(reset_seconds) };
+
+            super::RateLimitHeaders {
+                limit: self.limit as u64,
+                remaining,
+                reset_seconds,
+                retry_after_seconds,
+            }
+        }
+
         /// Drops timestamps that are now outside the window, i.e. at or
         /// before `cutoff` (= now - window).
         fn evict_before(&mut self, cutoff: f64) {
@@ -257,6 +384,29 @@ pub mod sliding_window {
         fn rejects_non_positive_config() {
             let result = std::panic::catch_unwind(|| SlidingWindowLimiter::new(0, 1.0));
             assert!(result.is_err());
+        }
+
+        #[test]
+        fn headers_on_allow_have_no_retry_after() {
+            let mut limiter = SlidingWindowLimiter::new(2, 1.0);
+            let allowed = limiter.try_acquire_at(0.0);
+            let headers = limiter.headers(0.0, allowed);
+            assert_eq!(headers.limit, 2);
+            assert_eq!(headers.remaining, 1);
+            assert_eq!(headers.retry_after_seconds, None);
+        }
+
+        #[test]
+        fn headers_on_deny_report_when_the_oldest_request_ages_out() {
+            let mut limiter = SlidingWindowLimiter::new(1, 1.0);
+            limiter.try_acquire_at(0.2);
+            let allowed = limiter.try_acquire_at(0.2);
+            let headers = limiter.headers(0.2, allowed);
+            assert!(!allowed);
+            assert_eq!(headers.remaining, 0);
+            // the request at t=0.2 ages out at t=1.2, 1s away
+            assert_eq!(headers.reset_seconds, 1);
+            assert_eq!(headers.retry_after_seconds, Some(1));
         }
     }
 }
